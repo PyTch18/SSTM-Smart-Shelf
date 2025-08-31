@@ -131,6 +131,8 @@ def main():
         print("Error: No camera found.")
         return
 
+    #For the external webcam choose index 0
+    #If this failed, please try other indexes
     print(f"Available cameras: {cams}")
     camera_index = int(input("👉 Enter the camera index you want to use: "))
     cap = cv2.VideoCapture(camera_index)
