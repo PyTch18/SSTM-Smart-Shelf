@@ -113,6 +113,10 @@ def display_frame(frame, frame_index):
 def list_available_cameras(max_tested=5):
     available = []
     for i in range(max_tested):
+
+        #Only fatal errors will appear, if you want to see debug messages, comment the following line
+        cv2.setLogLevel(1)
+
         cap = cv2.VideoCapture(i)
         if cap.isOpened():
             print(f"✅ Camera found at index {i}")
