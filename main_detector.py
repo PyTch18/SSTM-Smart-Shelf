@@ -123,7 +123,7 @@ def list_available_cameras(max_tested=5):
 
 def main():
     # Load YOLO model
-    model = YOLO("runs/detect/train2/weights/best.pt")
+    model = YOLO("detection_model.pt")
 
     # Open external webcam
     cams = list_available_cameras()
