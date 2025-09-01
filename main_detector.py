@@ -5,6 +5,7 @@ from collections import defaultdict
 import requests
 import json
 import os
+import base64
 
 # Define mapping from raw YOLO names to the 6 real money classes
 CLASS_MAPPING = {
@@ -124,6 +125,22 @@ def list_available_cameras(max_tested=5):
             cap.release()
     return available
 
+def upload_video_to_thingsboard(video_path, token, tb_url="http://localhost:8080"):
+    with open(video_path, "rb") as f:
+        video_bytes = f.read()
+        video_b64 = base64.b64encode(video_bytes).decode("utf-8")
+
+    url = f"{tb_url}/api/v1/{token}/telemetry"
+    headers = {"Content-Type": "application/json"}
+    payload = {"video_data": video_b64}
+
+    response = requests.post(url, headers=headers, data=json.dumps(payload))
+
+    if response.status_code == 200:
+        print("[SUCCESS] Video uploaded to ThingsBoard.")
+    else:
+        print(f"[ERROR] Failed to upload video. Status code: {response.status_code}")
+        print("Response:", response.text)
 
 def main():
     # Load YOLO model
@@ -135,8 +152,6 @@ def main():
         print("Error: No camera found.")
         return
 
-    #For the external webcam choose index 0
-    #If this failed, please try other indexes
     print(f"Available cameras: {cams}")
     camera_index = int(input("👉 Enter the camera index you want to use: "))
     cap = cv2.VideoCapture(camera_index)
@@ -151,7 +166,8 @@ def main():
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     recording = False
     out = None
-    last_detection_time = 0  # <-- track last detection timestamp
+    last_detection_time = 0
+    output_path = "output.mp4"
 
     while True:
         ret, frame = cap.read()
@@ -160,50 +176,44 @@ def main():
             break
 
         # Run YOLO detection
-        results = model(frame, imgsz=720)
+        results = model(frame, imgsz=720, conf=0.1)
         detections = results[0].boxes
-
-        # Debug
         print(f"Detections: {len(detections)}")
 
-        # If there’s a detection, update last_detection_time
         if len(detections) > 0:
             last_detection_time = time.time()
             if not recording:
                 print("🎥 Detection found! Start recording...")
                 recording = True
-                out = cv2.VideoWriter(
-                    "output.mp4",
-                    fourcc,
-                    20.0,
-                    (frame.shape[1], frame.shape[0])
-                )
+                out = cv2.VideoWriter(output_path, fourcc, 20.0, (frame.shape[1], frame.shape[0]))
 
-        # If recording, write frames
         if recording and out:
             out.write(frame)
 
-            # Check if 3 seconds passed since last detection
             if time.time() - last_detection_time >= 3:
                 print("🛑 No detections for 3s. Stopping recording...")
                 recording = False
                 out.release()
                 out = None
-                break  # stop after saving once (remove if you want continuous)
 
-        # Show annotated video
+                # ✅ Upload to ThingsBoard
+                DEVICE_TOKEN = "dm1weaxrbl4a3lvji5ja"
+                TB_URL = "https://demo.thingsboard.io"
+                upload_video_to_thingsboard(output_path, DEVICE_TOKEN, TB_URL)
+
+                break  # remove this if you want continuous capture
+
         annotated_frame = results[0].plot()
         cv2.imshow("Webcam", annotated_frame)
 
-        # Quit manually
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-    # Cleanup
     cap.release()
     if out:
         out.release()
     cv2.destroyAllWindows()
+
 
     # Uncomment below to send to ThingsBoard
     # DEVICE_TOKEN = "your_thingsboard_device_token"
