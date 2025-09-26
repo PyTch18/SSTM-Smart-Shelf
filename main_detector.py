@@ -4,8 +4,14 @@ import cv2
 from collections import defaultdict
 import requests
 import json
-import os
 import base64
+import boto3
+from datetime import datetime
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+import os, pickle
 
 # Define mapping from raw YOLO names to the 6 real money classes
 CLASS_MAPPING = {
@@ -31,6 +37,20 @@ CLASS_MAPPING = {
     "50_EGP": "50_EGP",
     "5_EGP": "5_EGP",
 }
+# --- Cloudflare R2 credentials ---
+ACCOUNT_ID = "e211aa6b51fd20ac35a5db3d56ecc2b5"
+ACCESS_KEY = "5d4c8643e1bcd7a1b45df55d7f72499f"
+SECRET_KEY = "fd28ed018c041c7c3d4b4267bcea1dab35705cf1f412936ef768362ff6c30c5d"
+BUCKET_NAME = "moneyrec"          # the bucket name
+ENDPOINT_URL = f"https://e211aa6b51fd20ac35a5db3d56ecc2b5.r2.cloudflarestorage.com"
+
+# Create a client once
+s3 = boto3.client(
+    's3',
+    endpoint_url=ENDPOINT_URL,
+    aws_access_key_id=ACCESS_KEY,
+    aws_secret_access_key=SECRET_KEY
+)
 
 def money_detector_counter(image_path, model):
     print(f"[INFO] Detecting objects in frame: {image_path}")
@@ -125,28 +145,63 @@ def list_available_cameras(max_tested=5):
             cap.release()
     return available
 
-def upload_video_to_thingsboard(video_path, token, tb_url="http://localhost:8080"):
-    with open(video_path, "rb") as f:
-        video_bytes = f.read()
-        video_b64 = base64.b64encode(video_bytes).decode("utf-8")
+#def upload_video_to_thingsboard(video_path, token, tb_url="http://localhost:8080"):
+    """Upload a video to ThingsBoard with a progress bar and delete after upload."""
+    file_size = os.path.getsize(video_path)
+
+    # stream read file in chunks to show progress bar
+    def file_stream():
+        with open(video_path, "rb") as f, tqdm(
+            total=file_size, unit="B", unit_scale=True, desc=f"Uploading {os.path.basename(video_path)}"
+        ) as pbar:
+            while True:
+                chunk = f.read(1024 * 64)
+                if not chunk:
+                    break
+                pbar.update(len(chunk))
+                yield chunk
+
+    video_bytes = open(video_path, "rb").read()
+    video_b64 = base64.b64encode(video_bytes).decode("utf-8")
+    payload = {"video_data": video_b64}
 
     url = f"{tb_url}/api/v1/{token}/telemetry"
     headers = {"Content-Type": "application/json"}
-    payload = {"video_data": video_b64}
 
-    response = requests.post(url, headers=headers, data=json.dumps(payload))
+    # Show progress bar for sending
+    with tqdm(total=len(json.dumps(payload)), unit="B", unit_scale=True, desc="Sending JSON") as pbar:
+        response = requests.post(url, headers=headers, data=json.dumps(payload))
+        pbar.update(len(json.dumps(payload)))
 
     if response.status_code == 200:
-        print("[SUCCESS] Video uploaded to ThingsBoard.")
+        print(f"[SUCCESS] {video_path} uploaded to ThingsBoard.")
+        os.remove(video_path)  # ✅ delete after upload
+        print(f"[INFO] Deleted local file {video_path}")
     else:
-        print(f"[ERROR] Failed to upload video. Status code: {response.status_code}")
+        print(f"[ERROR] Upload failed. Status code: {response.status_code}")
         print("Response:", response.text)
 
+def upload_video_to_r2(video_path):
+    now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    ext = os.path.splitext(video_path)[1]
+    filename = f"{now}{ext}"
+
+    s3.upload_file(video_path, BUCKET_NAME, filename,
+                   ExtraArgs={'ContentType': 'video/mp4'})  # set content-type for streaming
+
+    # Construct your public URL:
+    # If you’ve bound a custom domain to the bucket:
+    # public_url = f"https://videos.yourdomain.com/{filename}"
+    # Otherwise use Cloudflare’s pub-xxx.r2.dev URL (from the dashboard):
+    public_url = f"https://pub-aef7cfb1eb824b2693647f855caf80f4.r2.dev/{filename}"
+
+    print(f"[SUCCESS] {video_path} uploaded to R2 as {filename}")
+    print(f"[INFO] Public URL: {public_url}")
+    return public_url
+
 def main():
-    # Load YOLO model
     model = YOLO("detection_model.pt")
 
-    # Open external webcam
     cams = list_available_cameras()
     if not cams:
         print("Error: No camera found.")
@@ -155,7 +210,6 @@ def main():
     print(f"Available cameras: {cams}")
     camera_index = int(input("👉 Enter the camera index you want to use: "))
     cap = cv2.VideoCapture(camera_index)
-
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
@@ -167,7 +221,10 @@ def main():
     recording = False
     out = None
     last_detection_time = 0
-    output_path = "output.mp4"
+    video_counter = 1  # ✅ to increment filenames
+
+    DEVICE_TOKEN = "dm1weaxrbl4a3lvji5ja"
+    TB_URL = "https://demo.thingsboard.io"
 
     while True:
         ret, frame = cap.read()
@@ -178,30 +235,37 @@ def main():
         # Run YOLO detection
         results = model(frame, imgsz=720, conf=0.1)
         detections = results[0].boxes
-        print(f"Detections: {len(detections)}")
 
         if len(detections) > 0:
             last_detection_time = time.time()
             if not recording:
-                print("🎥 Detection found! Start recording...")
+                output_path = f"video_{video_counter}.mp4"  # ✅ incremented filename
+                print(f"🎥 Detection found! Start recording to {output_path}...")
                 recording = True
                 out = cv2.VideoWriter(output_path, fourcc, 20.0, (frame.shape[1], frame.shape[0]))
 
         if recording and out:
             out.write(frame)
 
+            # If no detections for ≥3 seconds, stop recording and upload
             if time.time() - last_detection_time >= 3:
                 print("🛑 No detections for 3s. Stopping recording...")
                 recording = False
                 out.release()
                 out = None
 
-                # ✅ Upload to ThingsBoard
-                DEVICE_TOKEN = "dm1weaxrbl4a3lvji5ja"
-                TB_URL = "https://demo.thingsboard.io"
-                upload_video_to_thingsboard(output_path, DEVICE_TOKEN, TB_URL)
+                # ✅ Upload to ThingsBoard with progress bar
+                public_url = upload_video_to_r2(output_path)
+                print("Public URL for ThingsBoard:", public_url)
 
-                break  # remove this if you want continuous capture
+                # (Optional) send the URL itself to ThingsBoard so it can display the video link:
+                payload = {"video_url": public_url}
+                url = f"{TB_URL}/api/v1/{DEVICE_TOKEN}/telemetry"
+                headers = {"Content-Type": "application/json"}
+                requests.post(url, headers=headers, data=json.dumps(payload))
+
+                # ✅ increment counter for next file
+                video_counter += 1
 
         annotated_frame = results[0].plot()
         cv2.imshow("Webcam", annotated_frame)
@@ -213,7 +277,6 @@ def main():
     if out:
         out.release()
     cv2.destroyAllWindows()
-
 
     # Uncomment below to send to ThingsBoard
     # DEVICE_TOKEN = "your_thingsboard_device_token"
