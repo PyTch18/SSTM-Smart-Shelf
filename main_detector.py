@@ -39,6 +39,7 @@ CLASS_MAPPING = {
 }
 # --- Cloudflare R2 credentials ---
 ACCOUNT_ID = "e211aa6b51fd20ac35a5db3d56ecc2b5"
+WORKER_URL = "https://moneysstm.amr2018azouz.workers.dev/"
 ACCESS_KEY = "5d4c8643e1bcd7a1b45df55d7f72499f"
 SECRET_KEY = "fd28ed018c041c7c3d4b4267bcea1dab35705cf1f412936ef768362ff6c30c5d"
 BUCKET_NAME = "moneyrec"          # the bucket name
@@ -182,12 +183,32 @@ def list_available_cameras(max_tested=5):
         print("Response:", response.text)
 
 def upload_video_to_r2(video_path):
+    # name file with datetime
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"{timestamp}.mp4"
+
+    # upload to R2
+    s3.upload_file(video_path, BUCKET_NAME, filename, ExtraArgs={"ContentType": "video/mp4"})
+
+    # return public Worker URL
+    return f"{WORKER_URL}video/{filename}"
+
+
+def upload_video_to_r2_2(video_path):
     now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     ext = os.path.splitext(video_path)[1]
     filename = f"{now}{ext}"
 
-    s3.upload_file(video_path, BUCKET_NAME, filename,
-                   ExtraArgs={'ContentType': 'video/mp4'})  # set content-type for streaming
+    s3.upload_file(
+        video_path,
+        BUCKET_NAME,
+        filename,
+        ExtraArgs={
+            "ContentType": "video/mp4",  # so browsers know it’s a video
+            "ACL": "public-read",  # make it accessible if bucket is public
+            "Access-Control-Allow-Origin": "*"
+    }
+    )
 
     # Construct your public URL:
     # If you’ve bound a custom domain to the bucket:
